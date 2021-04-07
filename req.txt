@@ -1,0 +1,5 @@
+# pip requirements file for ksync
+#
+# pip install -r req.txt
+
+toml
