@@ -38,15 +38,16 @@ printonly = False
 
 def scp_toremote(user, host, localsource, remotedest, port=None):
     print('copying %s to %s@%s:%s' % (localsource, user, host, remotedest))
+    localsources = localsource if type(localsource) == type([]) else [localsource]
     parg = ['-P%d' % port] if port else []
     if not printonly:
-        subprocess.run(['scp'] + parg + [localsource, '%s@%s:%s' % (user, host, remotedest)], check=True)
+        subprocess.run(['scp'] + parg + localsources + ['%s@%s:%s' % (user, host, remotedest)], check=True)
 
-def ssh(user, host, cmd, tty=False, port=None):
+def ssh(user, host, cmd, tty=False, port=None, check=True):
     print('executing ssh %s@%s %s' % (user, host, cmd))
     parg = ['-p%d' % port] if port else []
     if not printonly:
-        subprocess.run(['ssh'] + parg + ['-atx' if tty else '-anx', '%s@%s' % (user, host), cmd], check=True)
+        subprocess.run(['ssh'] + parg + ['-atx' if tty else '-anx', '%s@%s' % (user, host), cmd], check=check)
 
 def confirm(msg):
     print(msg)
@@ -140,16 +141,25 @@ class Ksync:
         else:
             raise Exception('config file must have an entry for %s in hosts section' % self.hostname)
 
-    def _get_workdir(self):
-        return self.me.get('working_directory', self.config.get('working_directory', '.'))
-    def _get_scpuser(self):
-        return self.me.get('scp_user', self.config.get('scp_user', None))
+    def _get(self, variable, host=None, default=None):
+        if host is None:
+            host = self.me
+        return host.get(variable, self.config.get(variable, default))
+    def _ssh_internal(self, host, cmd, tty=False, check=True):
+        ssh(self._get('scp_user', host=host), host['dns'][0], cmd, tty=tty, check=check)
+    def _scp_toremote(self, host, localsources, remotedest):
+        scp_toremote(self._get('scp_user', host=host), host['dns'][0], localsources, remotedest)
 
-    def install(self, host):
+    def install(self, host, sources):
         """ssh to the host and create its working directory if it doesn't exist. copy the config, req.txt,
-        and the .py files to the working directory.
+        and .py files to the working directory. create venv "pyenv" and pip install -r req.txt
         """
-        raise Exception('not implemented')
+        workdir = self._get('working_directory', host, default='.')
+        cmd = 'mkdir %s' % workdir
+        self._ssh_internal(host, cmd, check=False)
+        self._scp_toremote(host, sources, workdir)
+        cmd = 'cd "%s" && PATH=/usr/local/bin:"$PATH" python3 -m venv pyenv && pyenv/bin/pip install --upgrade pip && pyenv/bin/pip install -r req.txt' % workdir
+        self._ssh_internal(host, cmd)
 
     def _recurse_full(self, path, symlinks, fprints):
         if path.is_symlink():
@@ -166,7 +176,7 @@ class Ksync:
             else:
                 fprints[fp] = [payload]
         elif path.is_dir():
-            if not self.quietmode:
+            if not self.quietmode and path.parts[-1] != '@eaDir':
                 print(path)
             for p in path.iterdir():
                 self._recurse_full(p, symlinks, fprints)
@@ -189,14 +199,16 @@ class Ksync:
         fprints = {}
         for volume in volumes:
             self._recurse_full(Path(volume), symlinks, fprints)
-        fprintpath = Path(self._get_workdir(), '%s-%s-full.fprint' % (self.hostname, started.isoformat()))
+        workdir = self._get('working_directory', default='.')
+        fprintpath = Path(workdir, '%s-%s-full.fprint' % (self.hostname, started.isoformat()))
         with fprintpath.open('wt') as fprint:
             fprint.write("""
 {
   "started": "%s",
   "function": "SHA-256",
+  "volumes": %s,
   "symlinks":
-""" % (started.isoformat(),))
+""" % (started.isoformat(), json.dumps(volumes)))
             json.dump(symlinks, fprint)
             fprint.write(""",
   "fprints":
@@ -230,8 +242,6 @@ def main(argv, quietmode=False, fullmode=False):
         return main(argv, quietmode=quietmode, fullmode=True)
     cmd = argv[1]
     config = toml.load(argv[2])
-    if not os.environ.get('SSH_AUTH_SOCK', ''):
-        raise Exception('SSH_AUTH_SOCK not set -- you should be running ssh-agent')
     ksync = Ksync(config, quietmode, socket.gethostname())
     hosts = config.get('hosts', [])
     if len(argv) <= 3:
@@ -251,8 +261,11 @@ def main(argv, quietmode=False, fullmode=False):
     if not selected:
         raise Exception('no hosts specified in config file; nothing to do')
     if cmd == 'install':
+        if not os.environ.get('SSH_AUTH_SOCK', ''):
+            raise Exception('SSH_AUTH_SOCK not set -- you should be running ssh-agent')
+        sources = [argv[2], str(Path(argv[0]).with_name('req.txt')), argv[0]] # config, req.txt, and .py files
         for h in selected:
-            ksync.install(h)
+            ksync.install(h, sources)
     elif cmd == 'fprint':
         if len(argv) > 3:
             raise Exception('fprint runs locally only')
@@ -261,6 +274,8 @@ def main(argv, quietmode=False, fullmode=False):
         else:
             ksync.write_incremental()
     elif cmd == 'pull':
+        if not os.environ.get('SSH_AUTH_SOCK', ''):
+            raise Exception('SSH_AUTH_SOCK not set -- you should be running ssh-agent')
         for h in selected:
             ksync.pull(h)
     elif cmd == 'cp':
