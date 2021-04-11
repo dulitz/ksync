@@ -120,11 +120,15 @@ class Snapshot:
        If the most recent snapshot is incremental, also loads the snapshots on which it was based.
     """
     
-    def __init__(self, host):
-        pattern = '%s-20*.fprint' % host
-        matches = Path('.').glob(pattern)
-        if not matches:
-            raise Exception('no file %s in current directory' % pattern)
+    def __init__(self, hostdict, directory='.'):
+        hostlist = hostdict.get('dns', [])
+        for host in hostlist:
+            pattern = '%s-20*.fprint' % host
+            matches = [x for x in Path(directory).glob(pattern)]
+            if matches:
+                break
+        else:
+            raise FileNotFoundError('no files %s in current directory' % ' '.join(hostlist))
         self.stack = []
         self._load(matches[-1])
 
@@ -141,13 +145,53 @@ class Snapshot:
 
     def items(self):
         """returns an iterator over all the (fingerprint, filelist) items"""
+        fprints = [x['fprints'].items() for x in self.stack]
         lastfp = None
-        for pair in heapq.merge(*self.stack, key=lambda p: p[0]):
-            if lastfp != pair[0]:
+        for pair in heapq.merge(*fprints, key=lambda p: p[0]):
+            not_eadir = False
+            for f in pair[1]:
+                if f[0].find('/@eaDir') == -1:
+                    not_eadir = True
+                    break
+            if lastfp != pair[0] and not_eadir:
                 lastfp = pair[0]
                 yield pair
                 
 
+class CopySelector:
+    def __init__(self, srciter, targiter, prefixmap_src2targ):
+        (self.srciter, self.targiter, self.prefixmap) = (srciter, targiter, prefixmap_src2targ)
+
+    def _advance_targ(self):
+        if self.targpair is not None:
+            try:
+                self.targpair = next(self.targiter)
+            except StopIteration:
+                self.targpair = None
+
+    def __iter__(self):
+        """returns an iterator over (fprint, srcfilelist, targprefix) for every fprint in src but not targ"""
+        self.targpair = True
+        self._advance_targ()
+        for srcpair in self.srciter:
+            fprint = srcpair[0]
+            while self.targpair and self.targpair[0] < fprint:
+                self._advance_targ()
+            # now targ has fingerprint >= fprint
+            if self.targpair and self.targpair[0] == fprint:
+                # targ already has fprint, no need to copy
+                continue
+            def match(filelist, prefix):
+                for f in filelist:
+                    if f[0].startswith(prefix):
+                        return True
+                return False
+            for (srcprefix, targprefix) in self.prefixmap:
+                if match(srcpair[1], srcprefix):
+                    yield (fprint, srcpair[1], targprefix)
+                    break
+
+            
 class Ksync:
     def __init__(self, config, quietmode, hostname):
         (self.config, self.quietmode) = (config, quietmode)
@@ -207,16 +251,17 @@ class Ksync:
             else:
                 fprints[fp] = [payload]
         elif path.is_dir():
-            if not self.quietmode and path.parts[-1] != '@eaDir':
-                print(path)
-            try:
-                for p in path.iterdir():
-                    try:
-                        self._recurse_full(p, symlinks, fprints)
-                    except PermissionError as e:
-                        print('permission denied: %s' % e)
-            except PermissionError as e:
-                print('permission denied: %s' % e)
+            if path.parts[-1] != '@eaDir':
+                if not self.quietmode:
+                    print(path)
+                try:
+                    for p in path.iterdir():
+                        try:
+                            self._recurse_full(p, symlinks, fprints)
+                        except PermissionError as e:
+                            print('permission denied: %s' % e)
+                except PermissionError as e:
+                    print('permission denied: %s' % e)
     
     def write_full(self):
         """For each file in the filesystem, recursively, under roots specified in the config file:
@@ -258,10 +303,10 @@ class Ksync:
     def write_incremental(self, base=None):
         if base is None:
             # use the most recent fprint
-            raise Exception('not implemented')
+            raise NotImplementedError()
         with open(base, 'rt') as f:
             j = json.load(f)
-            raise Exception('not implemented')
+            raise NotImplementedError()
             
     def sync(self, source, target):
         """collect every filelist in target with length > 1.
@@ -281,29 +326,30 @@ class Ksync:
 
         symlinks ...
         """
+        workdir = self._getvar('working_directory', default='.')
         srchost = self._gethost(source)
         targhost = self._gethost(target)
-        src = Snapshot(source)
-        targ = Snapshot(target)
+        src = Snapshot(srchost, directory=workdir)
+        targ = Snapshot(targhost, directory=workdir)
         targvolumes = {}
         srcmatchprefixes = {}
         targmatchprefixes = {}
         for v in targ.get_volumes():
             p = Path(v).name
-            if targvolumes.has_key(p):
-                raise Exception('target %s has duplicate volumes for %s: %s' % (target, p, repr(targ.get_volumes())))
+            if p in targvolumes:
+                raise Exception('target %s has two paths for volume %s: %s' % (target, p, repr(targ.get_volumes())))
             targvolumes[p] = v
-        (nvolumes, nfiles, nbytes) = (0, 0, 0)
+        (ignoredvolumes, ignoredfiles, ignoredbytes, matchfiles, matchbytes) = ([], 0, 0, 0, 0)
         for v in src.get_volumes():
             targprefix = targvolumes.get(Path(v).name, None)
             if targprefix:
-                if srcmatchprefixes.has_key(v):
+                if v in srcmatchprefixes:
                     raise Exception('source %s has two paths for volume %s: %s' % (source, v, repr(src.get_volumes())))
                 srcmatchprefixes[v] = targprefix
                 assert not targprefix in targmatchprefixes, (targprefix, targmatchprefixes)
                 targmatchprefixes[targprefix] = v
             else:
-                nvolumes += 1
+                ignoredvolumes.append(v)
         def matches(prefix, payloads):
             for p in payloads:
                 if p[0].startswith(prefix):
@@ -312,17 +358,61 @@ class Ksync:
         for (fprint, payloadlist) in src.items():
             for prefix in srcmatchprefixes:
                 if matches(prefix, payloadlist):
+                    matchfiles += 1
+                    matchbytes += payloadlist[0][1]
                     break
             else:
-                nfiles += 1
-                nbytes += payloadlist[0][1]
+                ignoredfiles += 1
+                ignoredbytes += payloadlist[0][1]
         if not self.quietmode:
-            if nfiles or nvolumes or nbytes:
-                print('ignoring %d source volumes (%d files in %d MB) not in target' % (nvolumes, nfiles, math.floor(nbytes / 1024 / 1024)))
+            if ignoredfiles or ignoredvolumes or ignoredbytes:
+                print('ignoring source volumes %s (%d files in %d MB) not in target' % (', '.join(ignoredvolumes), ignoredfiles, math.floor(ignoredbytes / 1024 / 1024)))
             else:
                 print('target includes all source volumes')
-        raise Exception('not implemented')
 
+        (nbytes, copies, pathprefix_counts) = (0, [], PathPrefixCounter())
+        selector = CopySelector(src.items(), targ.items(), srcmatchprefixes.items())
+        for (fprint, srcfilelist, targprefix) in selector:
+            srcprefix = targmatchprefixes[targprefix]
+            for f in srcfilelist:
+                if f[0].startswith(srcprefix):
+                    ftarg = f[0].replace(srcprefix, targprefix, 1)
+                    copies.append((f[0], ftarg))
+                    pathprefix_counts.add_path(ftarg, f[1])
+                    break
+            else:
+                assert False, 'no matching prefix for %s' % ' '.join(srcfilelist)
+            nbytes += srcfilelist[0][1]
+        print('copying %d files in %d MB [total %d files in %d MB on matching volumes]' % (len(copies), math.floor(nbytes / 1024 / 1024), matchfiles, math.floor(matchbytes / 1024 / 1024)))
+
+        (lastprefix, lastlst) = ('*!nO', [0, 0])
+        for (prefix, lst) in pathprefix_counts.get_counts():
+            if str(prefix).startswith(str(lastprefix)) and lst == lastlst:
+                continue
+            if lst[0] > 9 and nbytes < lst[1] * 100:
+                print('%s: %d MB in %d files' % (prefix, math.floor(lst[1] / 1024 / 1024), lst[0]))
+                (lastprefix, lastlst) = (prefix, lst)
+        
+        # now actually do the copy
+        for (fromname, toname) in sorted(copies):
+            print('scp %s %s' % (fromname, toname))
+        
+        raise NotImplementedError()
+
+class PathPrefixCounter:
+    def __init__(self):
+        self.counts = {}
+    def add_path(self, path, nbytes):
+        for parent in Path(path).parents:
+            lst = self.counts.get(parent, None)
+            if lst:
+                lst[0] += 1
+                lst[1] += nbytes
+            else:
+                self.counts[parent] = [1, nbytes]
+    def get_counts(self):
+        return sorted(self.counts.items())
+    
 def main(argv, quietmode=False, fullmode=False):
     if len(argv) < 3:
         raise Exception('Usage: %s [--quiet] [--full] [install|fprint|pull|cp] configfile [host] ...' % argv[0])
@@ -370,13 +460,10 @@ def main(argv, quietmode=False, fullmode=False):
             ksync.write_full()
         else:
             ksync.write_incremental()
-    elif cmd == 'pull':
-        if not os.environ.get('SSH_AUTH_SOCK', ''):
-            raise Exception('SSH_AUTH_SOCK not set -- you should be running ssh-agent')
-        for h in selected:
-            ksync.pull(h)
     elif cmd == 'cp':
-        raise Exception('not implemented')
+        if len(argv) != 5:
+            raise Exception('Usage: %s %s configfile sourcehost targethost' % (argv[0], argv[1]))
+        ksync.sync(argv[3], argv[4])
     else:
         raise Exception('unknown command %s' % cmd)
     return 0
