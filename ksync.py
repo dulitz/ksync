@@ -1,10 +1,12 @@
 #!./pyenv/bin/python
 
-import heapq, math, os, socket
-import hashlib, json, subprocess, toml
+import heapq, os, socket, shlex, time
+import getpass, hashlib, json, subprocess, toml
 
 from datetime import datetime
 from pathlib import Path
+
+printonly = False
 
 ### config file specifies, for each hostname as returned by socket.gethostname(), a list of roots,
 ### and a list of prefixes to exclude. may also specify hostmap to override socket.gethostname()
@@ -34,8 +36,6 @@ from pathlib import Path
 ###   5. ksync cp that actually runs rsync or whatever
 ###   6. ksync install
 
-printonly = False
-
 def scp_toremote(user, host, localsource, remotedest, port=None):
     print('copying %s to %s@%s:%s' % (localsource, user, host, remotedest))
     localsources = localsource if type(localsource) == type([]) else [localsource]
@@ -43,13 +43,12 @@ def scp_toremote(user, host, localsource, remotedest, port=None):
     if not printonly:
         subprocess.run(['scp'] + parg + localsources + ['%s@%s:%s' % (user, host, remotedest)], check=True)
 
-def scp_fromremote(user, host, remotesource, localdest, port=None, strictfilenames=True):
-    print('copying %s@%s:%s to %s' % (remotesource, user, host, localdest))
+def scp_fromremote(user, host, remotesource, localdest, port=None, args=[]):
+    print('copying %s@%s:%s to %s' % (user, host, remotesource, localdest))
     remotesources = remotesource if type(remotesource) == type([]) else [remotesource]
-    parg = ['-P%d' % port] if port else []
-    targ = [] if strictfilenames else ['-T']
+    earg = ['ssh -p%d' % port] if port else ['ssh']
     if not printonly:
-        subprocess.run(['scp'] + parg + targ + ['%s@%s:%s' % (user, host, r) for r in remotesources] + [localdest], check=True)
+        subprocess.run(['rsync', '--checksum', '--partial-dir=.rsync-partial', '-e'] + earg + args + ['%s@%s:%s' % (user, host, r) for r in remotesources] + [localdest], check=True)
 
 def ssh(user, host, cmd, tty=False, port=None, check=True):
     print('executing ssh %s@%s %s' % (user, host, cmd))
@@ -65,6 +64,8 @@ def confirm(msg):
     else:
         raise KeyboardInterrupt
 
+def round_gb(nbytes):
+    return round(nbytes / 1024.0 / 1024.0 / 1024.0, 1)
 
 class FileHasher:
     def __init__(self, fname, bufsize=65536*16):
@@ -191,15 +192,113 @@ class CopySelector:
                     yield (fprint, srcpair[1], targprefix)
                     break
 
-            
+class PathPrefixCounter:
+    def __init__(self):
+        self.counts = {}
+    def add_path(self, path, nbytes):
+        for parent in Path(path).parents:
+            lst = self.counts.get(parent, None)
+            if lst:
+                lst[0] += 1
+                lst[1] += nbytes
+            else:
+                self.counts[parent] = [1, nbytes]
+    def get_counts(self):
+        return sorted(self.counts.items())
+
+class BandwidthManager:
+    def __init__(self, config):
+        self.bwlimits = config.get('bandwidth', {})
+        self.inuse = {}
+
+    def start(self, bw):
+        if bw:
+            self._modify_inuse(bw)
+    def stop(self, bw):
+        if bw:
+            (srchostname, targhostname, delta) = bw
+            self._modify_inuse((srchostname, targhostname, -delta))
+
+    def __str__(self):
+        s = ''
+        for (name, d) in self.inuse.values():
+            bwin = d.get('ingress', 0)
+            bwout = d.get('egress', 0)
+            stin = (' %d in' % bwin) if bwin else ''
+            stout = (' %d out' % bwout) if bwout else ''
+            if bwin or bwout:
+                s += '%s%s:%s%s' % (', ' if s else '', name, stin, stout)
+        return s if s else '[no bandwidth in use]'
+
+
+    def _modify_inuse(self, bw):
+        """positive delta is Mbps of flow being started; negative is Mbps of flow being stopped"""
+        (srchostname, targhostname, delta) = bw
+        srcdict = self.inuse.get(srchostname, {})
+        if not srcdict:
+            srcdict['egress'] = 0
+            srcdict['ingress'] = 0
+            self.inuse[srchostname] = srcdict
+        targdict = self.inuse.get(targhostname, {})
+        if not targdict:
+            targdict['egress'] = 0
+            targdict['ingress'] = 0
+            self.inuse[targhostname] = targdict
+        srcdict['egress'] += delta
+        targdict['ingress'] += delta
+        assert srcdict['egress'] >= 0 and targdict['ingress'] >= 0, (srcdict, targdict)
+
+    def select(self, srchost, targhost):
+        for srcp in srchost.get('public', []):
+            if srcp in targhost.get('public', []):
+                return None # on_lan
+
+        srcpublicnames = srchost.get('public', [])
+        targpublicnames = targhost.get('public', [])
+
+        egresslimits = [self._getlimit(self.bwlimits.get(p, {}), 'egress') for p in srcpublicnames]
+        ingresslimits = [self._getlimit(self.bwlimits.get(p, {}), 'ingress') for p in targpublicnames]
+
+        srcheadroom = [lim - self.inuse.get(name, {}).get('egress', 0) for (name, lim) in zip(srcpublicnames, egresslimits)]
+        targheadroom = [lim - self.inuse.get(name, {}).get('ingress', 0) for (name, lim) in zip(targpublicnames, ingresslimits)]
+
+        bw = min(max(srcheadroom), max(targheadroom))
+        srcname = None
+        for (name, hr) in zip(srcpublicnames, srcheadroom):
+            if hr >= bw:
+                srcname = name
+                break
+        assert srcname
+        for (name, hr) in zip(targpublicnames, targheadroom):
+            if hr >= bw:
+                targname = name
+                break
+        assert targname
+        return (srcname, targname, bw)
+
+    def _getlimit(self, lim, name):
+        override = lim.get('override', {})
+        ovstart = override.get('start', 0)
+        ovend = override.get('end', 0)
+        hour = datetime.now().hour
+        if (ovstart < ovend and ovstart <= hour and hour < ovend) or \
+           (ovend < ovstart and (hour < ovend or hour >= ovstart)):
+            return override.get(name, 10000)
+        else:
+            return lim.get(name, 10000)
+
+
 class Ksync:
     def __init__(self, config, quietmode, hostname):
         (self.config, self.quietmode) = (config, quietmode)
+        self.lastlogline = ''
         self.hostname = config.get('hostmap', {}).get(hostname, hostname)
 
         if 'hosts' not in config:
             raise Exception('config must have hosts section')
         self.me = self._gethost(self.hostname, ifnone={})
+        self.bwm = BandwidthManager(self.config)
+        self.copy_processes = []
 
     def _gethost(self, hostname, ifnone=None):
         for h in self.config['hosts']:
@@ -213,11 +312,18 @@ class Ksync:
             host = self.me
         return host.get(variable, self.config.get(variable, default))
     def _ssh_internal(self, host, cmd, tty=False, check=True):
-        ssh(self._getvar('scp_user', host=host), host['dns'][0], cmd, tty=tty, check=check)
+        ssh(self._getvar('ssh_user', host=host), host['dns'][0], cmd, tty=tty, check=check)
     def _scp_toremote(self, host, localsources, remotedest):
-        scp_toremote(self._getvar('scp_user', host=host), host['dns'][0], localsources, remotedest)
+        scp_toremote(self._getvar('ssh_user', host=host), host['dns'][0], localsources, remotedest)
     def _scp_fromremote(self, host, remotesources, localdest):
-        scp_fromremote(self._getvar('scp_user', host=host), host['dns'][0], remotesources, localdest, strictfilenames=False)
+        scp_fromremote(self._getvar('ssh_user', host=host), host['dns'][0], remotesources, localdest)
+
+    def _log(self, line):
+        if line == self.lastlogline:
+            print('.',)
+        else:
+            self.lastlogline = line
+            print(line)
 
     def install(self, host, sources):
         """ssh to the host and create its working directory if it doesn't exist. copy the config, req.txt,
@@ -366,9 +472,9 @@ class Ksync:
                 ignoredbytes += payloadlist[0][1]
         if not self.quietmode:
             if ignoredfiles or ignoredvolumes or ignoredbytes:
-                print('ignoring source volumes %s (%d files in %d MB) not in target' % (', '.join(ignoredvolumes), ignoredfiles, math.floor(ignoredbytes / 1024 / 1024)))
+                print('ignoring source %s volumes %s (%d files in %s GB) not in target %s' % (source, ', '.join(ignoredvolumes), ignoredfiles, round_gb(ignoredbytes), target))
             else:
-                print('target includes all source volumes')
+                print('target %s includes all volumes from source %s' % (target, source))
 
         (nbytes, copies, pathprefix_counts) = (0, [], PathPrefixCounter())
         selector = CopySelector(src.items(), targ.items(), srcmatchprefixes.items())
@@ -376,42 +482,172 @@ class Ksync:
             srcprefix = targmatchprefixes[targprefix]
             for f in srcfilelist:
                 if f[0].startswith(srcprefix):
-                    ftarg = f[0].replace(srcprefix, targprefix, 1)
-                    copies.append((f[0], ftarg))
-                    pathprefix_counts.add_path(ftarg, f[1])
+                    copies.append((f[0], f[0].replace(srcprefix, targprefix, 1), targprefix))
+                    start = srcprefix.rfind('/')
+                    pathprefix_counts.add_path(f[0].replace(srcprefix, srcprefix[start:], 1), f[1])
                     break
             else:
                 assert False, 'no matching prefix for %s' % ' '.join(srcfilelist)
             nbytes += srcfilelist[0][1]
-        print('copying %d files in %d MB [total %d files in %d MB on matching volumes]' % (len(copies), math.floor(nbytes / 1024 / 1024), matchfiles, math.floor(matchbytes / 1024 / 1024)))
 
-        (lastprefix, lastlst) = ('*!nO', [0, 0])
+        targfiles = {}
+        for (fprint, payloadlist) in targ.items():
+            for p in payloadlist:
+                targfiles[p[1]] = True
+        replacefiles = 0
+        for (src, targ, targprefix) in copies:
+            if targ in targfiles:
+                replacefiles += 1
+        print('copying %d files in %s GB replacing %d files [total %d files in %s GB on matching volumes]' % (len(copies), round_gb(nbytes), replacefiles, matchfiles, round_gb(matchbytes)))
+
+        (lastprefix, lastlst) = ('/', [0, 0])
         for (prefix, lst) in pathprefix_counts.get_counts():
-            if str(prefix).startswith(str(lastprefix)) and lst == lastlst:
+            strprefix = str(prefix)
+            if strprefix.startswith(lastprefix) and lst == lastlst:
                 continue
             if lst[0] > 9 and nbytes < lst[1] * 100:
-                print('%s: %d MB in %d files' % (prefix, math.floor(lst[1] / 1024 / 1024), lst[0]))
-                (lastprefix, lastlst) = (prefix, lst)
-        
-        # now actually do the copy
-        for (fromname, toname) in sorted(copies):
-            print('scp %s %s' % (fromname, toname))
-        
-        raise NotImplementedError()
+                assert lastprefix[0] == '/', lastprefix
+                assert strprefix[0] == '/', strprefix
+                slash = 0
+                for n in range(1, min(len(lastprefix), len(strprefix))):
+                    if strprefix[n] == '/':
+                        slash = n
+                    if lastprefix[n] != strprefix[n]:
+                        break
+                spaced = strprefix[slash:].rjust(len(strprefix), ' ')
+                print('%s: %s GB in %d files' % (spaced, round_gb(lst[1]), lst[0]))
+                (lastprefix, lastlst) = (strprefix, lst)
 
-class PathPrefixCounter:
-    def __init__(self):
-        self.counts = {}
-    def add_path(self, path, nbytes):
-        for parent in Path(path).parents:
-            lst = self.counts.get(parent, None)
-            if lst:
-                lst[0] += 1
-                lst[1] += nbytes
+        last = datetime.now()
+        sorted_copies = sorted(copies)
+        while sorted_copies or self.copy_processes:
+            sorted_copies = self._schedule_copy(sorted_copies, srchost, targhost)
+            if (datetime.now() - last).seconds > 1*60:
+                self._log('%d files not started; %d processes %s' % (len(sorted_copies), len(self.copy_processes), self.bwm))
+                last = datetime.now()
+
+        self._log('completed successfully')
+
+    def _schedule_copy(self, sorted_copies, srchost, targhost):
+        """sorted_copies is a list of (sourcefilename, targetfilename, targetprefix) tuples of all files
+           remaining to be copied, sorted lexicographically by sourcefilename.
+
+           If bandwidth is available to start a new copy, we start a copy of the first N files in
+           sorted_copies. If bandwidth is not available, we wait one minute for bandwidth to
+           become available (and/or a previously started copy to end). Either way we return a suffix
+           of sorted_copies representing the files for which no copy has been started.
+        """
+        running_processes = []
+        if self.copy_processes:
+            for (bw, p) in self.copy_processes:
+                retval = p.poll()
+                if retval is None:
+                    running_processes.append((bw, p)) # not terminated
+                else:
+                    if retval:
+                        self._log('%s aborted with code %d' % (p.args, retval))
+                        # TODO: restart this once?
+                    self.bwm.stop(bw)
+            if running_processes:
+                time.sleep(1)
+        self.copy_processes = running_processes
+        if not sorted_copies:
+            return sorted_copies
+        
+        # host is the host we are sshing to, and otherhost is the host running ssh
+        def userhost(host, otherhost, sel):
+            user = self._getvar('ssh_user', host)
+            otheruser = self._getvar('ssh_user', otherhost)
+            userprefix = '' if user == otheruser else '%s@' % user
+            if sel is None:
+                return (None, '%s%s:' % (userprefix, host['dns'][0])) # None = no override of ssh port
+            (srcname, targname, bw) = sel
+            if bw == 0:
+                return (None, None)
+            bwmap = self.config.get('bandwidth', {})
+            ports = self._getvar('scp_ports', host, default=[])
+            srcegressports = bwmap.get(srcname, {}).get('egress_ports', []) or ports
+            targegressports = bwmap.get(targname, {}).get('egress_ports', []) or ports
+            srcingressok = not gwmap.get(srcname, {}).get('no_ingress_ports', None)
+            targingressok = not gwmap.get(targname, {}).get('no_ingress_ports', None)
+            if srcname in host.get('public', []):
+                # case (B): on targhost, ssh -p targegressport srcname:<path> <localfilename>
+                for port in targegressports:
+                    if port in ports and srcingressok:
+                        return (port, '%s%s:' % (userprefix, srcname))
+                return (None, None)
             else:
-                self.counts[parent] = [1, nbytes]
-    def get_counts(self):
-        return sorted(self.counts.items())
+                # case (A): on srchost, ssh -p srcegressport <localfilename> targname:<path>
+                assert srcname in otherhost.get('public', []), (host, otherhost, srcname, targname)
+                for port in srcegressports:
+                    if port in ports and targingressok:
+                        return (port, '%s%s:' % (userprefix, targname))
+                return (None, None)
+
+        sel = self.bwm.select(srchost, targhost)
+
+        # sel is None or (srcname, targname, bw). If sel is None, the copy is on the LAN, is not
+        # bandwidth-restricted, and should be made to one of the 'dns' names on port 22.
+        # If bw is 0, a copy cannot proceed. Otherwise, rsync may be run
+        #  (A) locally on the source host, to targhost at any of the ports for srchost in bandwidth AND
+        #      in targhost; OR
+        #  (B) locally on the target host, from srchost at any of the ports for targhost in bandwidth AND
+        #      in srchost.
+        # If there is no port that is both in bandwidth and in targhost, rsync may not be
+        # run on the source host (i.e. case (A) is forbidden). If there is no port that is both in
+        # bandwidth and in srchost, rsync may not be run on the target host (case (B) is forbidden).
+        # If both cases are forbidden, a copy may not proceed between that host-pair.
+        
+        (srcport, srcuserhost) = userhost(srchost, targhost, sel) # case B
+        (targport, targuserhost) = userhost(targhost, srchost, sel) # case A
+
+        if (not srcuserhost) and (not targuserhost):
+            return sorted_copies # we can't start a copy right now
+
+        assert sorted_copies # we checked for this above
+
+        CHUNKSIZE = 10 # FIXME, use file size
+        prefix = sorted_copies[0][2]
+        chunk = [f for f in sorted_copies[:CHUNKSIZE] if f[2] == prefix]
+
+        # chunk are the next CHUNKSIZE files with the same prefix (e.g. in the same volume).
+        # we are local to either src or targ and need to adjust the relative path root accordingly
+
+        def addrelative(toinsert, complete, prefix):
+            # we insert /./ at the point in "toinsert" where the volume ends; that is where
+            # rsync should treat the relative path as beginning.
+            assert complete.startswith(prefix), (toinsert, complete, prefix)
+            suffix = complete[len(prefix):]
+            assert toinsert.endswith(suffix), (toinsert, complete, prefix, suffix)
+            pivot = len(toinsert) - len(suffix)
+            return '%s/.%s' % (toinsert[:pivot], toinsert[pivot:])
+
+        if srcuserhost: # then we will run rsync on targhost
+            if self.me.get('dns', ['']) == targhost['dns']:
+                sshwrap = []
+            else:
+                sshwrap = ['ssh', '-nxAT', '%s@%s' % (self._getvar('ssh_user', targhost), targhost['dns'][0])]
+            earg = ['ssh -p%s' % srcport] if srcport else ['ssh']
+            sources = ['%s%s' % (srcuserhost, addrelative(f[0], f[1], f[2])) for f in chunk]
+            dest = [chunk[0][2]]
+        else: # we will run rsync on srchost
+            assert targuserhost
+            if self.me.get('dns', ['']) == srchost['dns']:
+                sshwrap = []
+            else:
+                sshwrap = ['ssh', '-nxAT', '%s@%s' % (self._getvar('ssh_user', srchost), srchost['dns'][0])]
+            earg = ['ssh -p%s' % targport] if targport else ['ssh']
+            sources = [addrelative(f[0], f[1], f[2]) for f in chunk]
+            dest = ['%s%s' % (targuserhost, chunk[0][2])]
+
+        if printonly:
+            sshwrap = ['echo'] + sshwrap
+        bwlimit = ['--bwlimit=%d' % (sel[2]*1000)] if (sel and sel[2]) else []
+        p = subprocess.Popen(sshwrap + ['rsync'] + bwlimit + ['--protect-args', '--checksum', '--relative', '--partial-dir=.rsync-partial', '-e'] + ([shlex.quote(f) for f in earg + sources + dest] if sshwrap else (earg + sources + dest)))
+        self.bwm.start(sel)
+        self.copy_processes.append((sel, p))
+        return sorted_copies[len(chunk):]
+
     
 def main(argv, quietmode=False, fullmode=False):
     if len(argv) < 3:
