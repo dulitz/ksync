@@ -477,6 +477,7 @@ class Ksync:
 
         symlinks ...
         """
+        self.process_failures = 0
         workdir = self._getvar('working_directory', default='.')
         srchost = self._gethost(source)
         targhost = self._gethost(target)
@@ -568,7 +569,8 @@ class Ksync:
         while sorted_copies or self.copy_processes:
             sorted_copies = self._schedule_copy(sorted_copies, srchost, targhost)
             if (datetime.now() - last).seconds > 1*60:
-                self._log('%d files not started; %d copies %s' % (len(sorted_copies), len(self.copy_processes), self.bwm))
+                fails = (' (%d failed)' % self.process_failures) if self.process_failures else ''
+                self._log('%d files not started; %d copies%s %s' % (len(sorted_copies), len(self.copy_processes), fails, self.bwm))
                 last = datetime.now()
 
         self._log('completed successfully')
@@ -591,6 +593,7 @@ class Ksync:
                 else:
                     if retval:
                         self._log('%s aborted with code %d' % (p.args, retval))
+                        self.process_failures += 1
                         # TODO: restart this once?
                     self.bwm.stop(bw)
             if running_processes:
