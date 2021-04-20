@@ -8,6 +8,11 @@ from pathlib import Path
 
 printonly = False
 
+### TODO: track of deleted files to see whether a given fingerprint really still
+### exists after an incremental deletion.
+###
+### TODO: handle specific interfaces (LANs) being bound to specific egress
+
 ### config file specifies, for each hostname as returned by socket.gethostname(), a list of roots,
 ### and a list of prefixes to exclude. may also specify hostmap to override socket.gethostname()
 ### for filenames and ssh.
@@ -121,17 +126,18 @@ class Snapshot:
        If the most recent snapshot is incremental, also loads the snapshots on which it was based.
     """
     
-    def __init__(self, hostdict, directory='.'):
+    def __init__(self, hostdict, directory='.', pattern='%s-20*.fprint'):
         hostlist = hostdict.get('dns', [])
         for host in hostlist:
-            pattern = '%s-20*.fprint' % host
-            matches = [x for x in Path(directory).glob(pattern)]
+            hostpattern = pattern % host
+            matches = [x for x in Path(directory).glob(hostpattern)]
             if matches:
                 break
         else:
-            raise FileNotFoundError('no files %s in current directory' % ' '.join(hostlist))
+            raise FileNotFoundError('no files matching %s for hosts %s in directory %s' % (pattern, ' '.join(hostlist), directory))
         self.stack = []
-        self._load(matches[-1])
+        self.top_filename = matches[-1]
+        self._load(self.top_filename)
 
     def _load(self, fname):
         with open(fname, 'rt') as f:
@@ -140,6 +146,9 @@ class Snapshot:
             based_on = j.get('based_on', '')
             if based_on:
                 self._load(based_on)
+
+    def get_top_filename(self):
+        return self.top_filename
 
     def get_volumes(self):
         return self.stack[0]['volumes'] # most recent incremental
@@ -342,15 +351,19 @@ class Ksync:
         remoteworkdir = self._getvar('working_directory', host, default='.')
         self._scp_fromremote(host, '%s/`hostname`-20*.fprint' % remoteworkdir, self._getvar('working_directory'))
 
-    def _recurse_full(self, path, symlinks, fprints):
+    def _recurse(self, path, symlinks, fprints, base_files={}):
         if path.is_symlink():
             s = path.lstat()
             symlinks.append((str(path), os.readlink(path), s.st_mode, s.st_ctime, s.st_mtime))
         elif path.is_file():
             s = path.stat()
+            payload = (str(path), s.st_size, s.st_nlink, s.st_mode, s.st_ctime, s.st_mtime)
+            base_payload = base_files.get(payload[0], None)
+            if base_payload is not None:
+                if base_payload[1] == payload[1] and base_payload[5] == payload[5]:
+                    return # we are incremental and parent has file with same size and mtime
             h = FileHasher(path)
             fp = h.do_hash()
-            payload = (str(path), s.st_size, s.st_nlink, s.st_mode, s.st_ctime, s.st_mtime)
             existing = fprints.get(fp, None)
             if existing is not None:
                 existing.append(payload)
@@ -363,7 +376,7 @@ class Ksync:
                 try:
                     for p in path.iterdir():
                         try:
-                            self._recurse_full(p, symlinks, fprints)
+                            self._recurse(p, symlinks, fprints, base_files)
                         except PermissionError as e:
                             print('permission denied: %s' % e)
                 except PermissionError as e:
@@ -386,7 +399,7 @@ class Ksync:
         symlinks = []
         fprints = {}
         for volume in volumes:
-            self._recurse_full(Path(volume), symlinks, fprints)
+            self._recurse(Path(volume), symlinks, fprints)
         workdir = self._getvar('working_directory', default='.')
         fprintpath = Path(workdir, '%s-%s-full.fprint' % (self.hostname, started.isoformat()))
         with fprintpath.open('wt') as fprint:
@@ -407,12 +420,44 @@ class Ksync:
 """)
 
     def write_incremental(self, base=None):
+        volumes = self.me.get('volumes', [])
+        if not volumes:
+            raise Exception('config file entry for %s in hosts section must have volumes' % self.hostname)
+
+        workdir = self._getvar('working_directory', default='.')
         if base is None:
             # use the most recent fprint
-            raise NotImplementedError()
-        with open(base, 'rt') as f:
-            j = json.load(f)
-            raise NotImplementedError()
+            snap = Snapshot(self.me, directory=workdir)
+        else:
+            snap = Snapshot(self.me, directory=workdir, pattern=base)
+        base_files = {}
+        for (fp, flist) in snap.items():
+            for f in flist:
+                base_files[f[0]] = [fp] + f[1:]
+
+        started = datetime.now().replace(microsecond=0)
+        symlinks = []
+        fprints = {}
+        for volume in volumes:
+            self._recurse(Path(volume), symlinks, fprints, base_files)
+        fprintpath = Path(workdir, '%s-%s.fprint' % (self.hostname, started.isoformat()))
+        with fprintpath.open('wt') as fprint:
+            fprint.write("""
+{
+  "based_on": "%s",
+  "started": "%s",
+  "function": "SHA-256",
+  "volumes": %s,
+  "symlinks":
+""" % (snap.get_top_filename(), started.isoformat(), json.dumps(volumes)))
+            json.dump(sorted(symlinks), fprint)
+            fprint.write(""",
+  "fprints":
+""")
+            json.dump(fprints, fprint, sort_keys=True)
+            fprint.write("""
+}
+""")
             
     def sync(self, source, target):
         """collect every filelist in target with length > 1.
@@ -523,7 +568,7 @@ class Ksync:
         while sorted_copies or self.copy_processes:
             sorted_copies = self._schedule_copy(sorted_copies, srchost, targhost)
             if (datetime.now() - last).seconds > 1*60:
-                self._log('%d files not started; %d processes %s' % (len(sorted_copies), len(self.copy_processes), self.bwm))
+                self._log('%d files not started; %d copies %s' % (len(sorted_copies), len(self.copy_processes), self.bwm))
                 last = datetime.now()
 
         self._log('completed successfully')
