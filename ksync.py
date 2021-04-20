@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 printonly = False
+##printonly = True
 
 ### TODO: track of deleted files to see whether a given fingerprint really still
 ### exists after an incremental deletion.
@@ -230,7 +231,7 @@ class BandwidthManager:
 
     def __str__(self):
         s = ''
-        for (name, d) in self.inuse.values():
+        for (name, d) in self.inuse.items():
             bwin = d.get('ingress', 0)
             bwout = d.get('egress', 0)
             stin = (' %d in' % bwin) if bwin else ''
@@ -329,7 +330,7 @@ class Ksync:
 
     def _log(self, line):
         if line == self.lastlogline:
-            print('.',)
+            print('.', end='', flush=True)
         else:
             self.lastlogline = line
             print(line)
@@ -478,6 +479,7 @@ class Ksync:
         symlinks ...
         """
         self.process_failures = 0
+        self.process_zombies = 0
         workdir = self._getvar('working_directory', default='.')
         srchost = self._gethost(source)
         targhost = self._gethost(target)
@@ -528,7 +530,7 @@ class Ksync:
             srcprefix = targmatchprefixes[targprefix]
             for f in srcfilelist:
                 if f[0].startswith(srcprefix):
-                    copies.append((f[0], f[0].replace(srcprefix, targprefix, 1), targprefix))
+                    copies.append((f[0], f[0].replace(srcprefix, targprefix, 1), targprefix, f[2]))
                     start = srcprefix.rfind('/')
                     pathprefix_counts.add_path(f[0].replace(srcprefix, srcprefix[start:], 1), f[1])
                     break
@@ -540,11 +542,12 @@ class Ksync:
         for (fprint, payloadlist) in targ.items():
             for p in payloadlist:
                 targfiles[p[1]] = True
-        replacefiles = 0
-        for (src, targ, targprefix) in copies:
+        (replacefiles, replacebytes) = (0, 0)
+        for (src, targ, targprefix, size) in copies:
             if targ in targfiles:
                 replacefiles += 1
-        print('copying %d files in %s GB replacing %d files [total %d files in %s GB on matching volumes]' % (len(copies), round_gb(nbytes), replacefiles, matchfiles, round_gb(matchbytes)))
+                replacebytes += size
+        print('copying %d files in %s GB replacing %d files in %s GB [total %d files in %s GB on matching volumes]' % (len(copies), round_gb(nbytes), replacefiles, round_gb(replacebytes), matchfiles, round_gb(matchbytes)))
 
         (lastprefix, lastlst) = ('/', [0, 0])
         for (prefix, lst) in pathprefix_counts.get_counts():
@@ -570,7 +573,8 @@ class Ksync:
             sorted_copies = self._schedule_copy(sorted_copies, srchost, targhost)
             if (datetime.now() - last).seconds > 1*60:
                 fails = (' (%d failed)' % self.process_failures) if self.process_failures else ''
-                self._log('%d files not started; %d copies%s %s' % (len(sorted_copies), len(self.copy_processes), fails, self.bwm))
+                zombies = (' (%d zombies)' % self.process_zombies) if self.process_zombies else ''
+                self._log('%d files not started; %d copies%s%s %s' % (len(sorted_copies), len(self.copy_processes), zombies, fails, self.bwm))
                 last = datetime.now()
 
         self._log('completed successfully')
@@ -586,10 +590,18 @@ class Ksync:
         """
         running_processes = []
         if self.copy_processes:
-            for (bw, p) in self.copy_processes:
+            for (bw, p, size, started) in self.copy_processes:
                 retval = p.poll()
                 if retval is None:
-                    running_processes.append((bw, p)) # not terminated
+                    elapsed = datetime.now() - started
+                    target = size / (bw[2] * 1024 * 1024 * 10) if bw else elapsed
+                    # ssh with ServerAliveInterval should prevent zombies, so we disable this for now
+                    if False: # bw and elapsed > 120 + 4 * target:
+                        self.process_zombies += 1
+                        self.bwm.stop(bw)
+                        self._log('zombie process copying %s GB at limit %s Mb/s reaped after %d sec' % (round_gb(size), bw, elapsed))
+                        bw = None
+                    running_processes.append((bw, p, size, started)) # not terminated
                 else:
                     if retval:
                         self._log('%s aborted with code %d' % (p.args, retval))
@@ -616,8 +628,8 @@ class Ksync:
             ports = self._getvar('scp_ports', host, default=[])
             srcegressports = bwmap.get(srcname, {}).get('egress_ports', []) or ports
             targegressports = bwmap.get(targname, {}).get('egress_ports', []) or ports
-            srcingressok = not gwmap.get(srcname, {}).get('no_ingress_ports', None)
-            targingressok = not gwmap.get(targname, {}).get('no_ingress_ports', None)
+            srcingressok = not bwmap.get(srcname, {}).get('no_ingress_ports', None)
+            targingressok = not bwmap.get(targname, {}).get('no_ingress_ports', None)
             if srcname in host.get('public', []):
                 # case (B): on targhost, ssh -p targegressport srcname:<path> <localfilename>
                 for port in targegressports:
@@ -669,6 +681,8 @@ class Ksync:
             assert toinsert.endswith(suffix), (toinsert, complete, prefix, suffix)
             pivot = len(toinsert) - len(suffix)
             return '%s/.%s' % (toinsert[:pivot], toinsert[pivot:])
+        def includefile(f):
+            return f.find('/.Maildir/') == -1 and f.find('/.DS_Store') == -1
 
         if srcuserhost: # then we will run rsync on targhost
             if self.me.get('dns', ['']) == targhost['dns']:
@@ -676,16 +690,16 @@ class Ksync:
             else:
                 sshwrap = ['ssh', '-nxAT', '%s@%s' % (self._getvar('ssh_user', targhost), targhost['dns'][0])]
             earg = ['ssh -p%s' % srcport] if srcport else ['ssh']
-            sources = ['%s%s' % (srcuserhost, addrelative(f[0], f[1], f[2])) for f in chunk]
+            sources = ['%s%s' % (srcuserhost, addrelative(f[0], f[1], f[2])) for f in chunk if includefile(f[0])]
             dest = [chunk[0][2]]
         else: # we will run rsync on srchost
             assert targuserhost
             if self.me.get('dns', ['']) == srchost['dns']:
                 sshwrap = []
             else:
-                sshwrap = ['ssh', '-nxAT', '%s@%s' % (self._getvar('ssh_user', srchost), srchost['dns'][0])]
+                sshwrap = ['ssh', '-nxAT', '-oServerAliveInterval=10', '%s@%s' % (self._getvar('ssh_user', srchost), srchost['dns'][0])]
             earg = ['ssh -p%s' % targport] if targport else ['ssh']
-            sources = [addrelative(f[0], f[1], f[2]) for f in chunk]
+            sources = [addrelative(f[0], f[1], f[2]) for f in chunk if includefile(f[0])]
             dest = ['%s%s' % (targuserhost, chunk[0][2])]
 
         if printonly:
@@ -693,7 +707,7 @@ class Ksync:
         bwlimit = ['--bwlimit=%d' % (sel[2]*1000)] if (sel and sel[2]) else []
         p = subprocess.Popen(sshwrap + ['rsync'] + bwlimit + ['--protect-args', '--checksum', '--relative', '--partial-dir=.rsync-partial', '-e'] + ([shlex.quote(f) for f in earg + sources + dest] if sshwrap else (earg + sources + dest)))
         self.bwm.start(sel)
-        self.copy_processes.append((sel, p))
+        self.copy_processes.append((sel, p, sum([f[3] for f in chunk]), datetime.now()))
         return sorted_copies[len(chunk):]
 
     
@@ -755,22 +769,3 @@ def main(argv, quietmode=False, fullmode=False):
 if __name__ == "__main__":
     import sys
     sys.exit(main(sys.argv))
-
-old_source = """
-
-source=EMPAC
-source=KL-disks
-#source="KL-disks/Flyhouse Experiments"
-
-target=""
-target=""
-#target="KL-disks/"
-
-server=northwest
-#server=west
-
-tmpfile=rsync-`basename "$source"`.out
-
-nohup rsync -rhv --partial -e 'ssh -p2298' "$source" rsync://daniel@"$server".epispace.com/klnas/"$target" >>/tmp/"$tmpfile"
-
-"""
