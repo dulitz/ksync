@@ -1,7 +1,8 @@
 #!./pyenv/bin/python
 
 import heapq, os, socket, shlex, time
-import getpass, hashlib, json, subprocess, toml
+import getpass, hashlib, json, subprocess
+import prometheus_client, toml
 
 from datetime import datetime
 from pathlib import Path
@@ -302,6 +303,15 @@ class Ksync:
     def __init__(self, config, quietmode, hostname):
         (self.config, self.quietmode) = (config, quietmode)
         self.lastlogline = ''
+        self.statusmap = {}
+        self.prominfo = prometheus_client.Info('ksync', 'Configuration settings for ksync')
+        self.promzombies = prometheus_client.Counter('process_zombies', 'zombie rsyncs killed')
+        self.promrestarts = prometheus_client.Counter('process_restarts', 'rsyncs restarted')
+        self.promfails = prometheus_client.Counter('process_failures', 'rsyncs failed and not restarted')
+        self.promfiles = prometheus_client.Counter('files_copied', 'files copied successfully')
+        self.prombytes = prometheus_client.Counter('bytes_copied', 'bytes copied successfully')
+        self.promrunning = prometheus_client.Gauge('processes_running', 'rsyncs running')
+        self.promlatency = prometheus_client.Summary('process_latency', 'rsync latency')
         self.hostname = config.get('hostmap', {}).get(hostname, hostname)
 
         if 'hosts' not in config:
@@ -329,11 +339,18 @@ class Ksync:
         scp_fromremote(self._getvar('ssh_user', host=host), host['dns'][0], remotesources, localdest)
 
     def _log(self, line):
-        if line == self.lastlogline:
-            print('.', end='', flush=True)
-        else:
-            self.lastlogline = line
-            print(line)
+        if not self.quietmode:
+            if line == self.lastlogline:
+                print('.', end='', flush=True)
+            else:
+                self.lastlogline = line
+                print(line)
+    def _prometheus(self):
+        self.promrunning.set(len(self.copy_processes))
+        for n in range(0, len(self.copy_processes)):
+            self.statusmap['process_%d' % n] = ' '.join(self.copy_processes[n][1].args)
+        self.statusmap['bandwidthmanager'] = str(self.bwm)
+        self.prominfo.info(self.statusmap)
 
     def install(self, host, sources):
         """ssh to the host and create its working directory if it doesn't exist. copy the config, req.txt,
@@ -349,8 +366,9 @@ class Ksync:
     def pull(self, host):
         """scp to host to copy its fprint files here.
         """
-        remoteworkdir = self._getvar('working_directory', host, default='.')
-        self._scp_fromremote(host, '%s/`hostname`-20*.fprint' % remoteworkdir, self._getvar('working_directory'))
+        if self.hostname not in host.get('dns'):
+            remoteworkdir = self._getvar('working_directory', host, default='.')
+            self._scp_fromremote(host, '%s/`hostname`-20*.fprint' % remoteworkdir, self._getvar('working_directory'))
 
     def _recurse(self, path, symlinks, fprints, base_files={}):
         if path.is_symlink():
@@ -485,6 +503,13 @@ class Ksync:
         targhost = self._gethost(target)
         src = Snapshot(srchost, directory=workdir)
         targ = Snapshot(targhost, directory=workdir)
+        self.statusmap = {
+            'source': source,
+            'target': target,
+            'working_directory': workdir,
+            'source_snapshot': src.get_top_filename(),
+            'target_snapshot': targ.get_top_filename()
+            }
         targvolumes = {}
         srcmatchprefixes = {}
         targmatchprefixes = {}
@@ -518,11 +543,13 @@ class Ksync:
             else:
                 ignoredfiles += 1
                 ignoredbytes += payloadlist[0][1]
+        if ignoredfiles or ignoredvolumes or ignoredbytes:
+            self.statusmap['ignored'] = 'ignoring source %s volumes %s (%d files in %s GB) not in target %s' % (source, ', '.join(ignoredvolumes), ignoredfiles, round_gb(ignoredbytes), target)
+        else:
+            self.statusmap['ignored'] = 'target %s includes all volumes from source %s' % (target, source)
+        self._prometheus()
         if not self.quietmode:
-            if ignoredfiles or ignoredvolumes or ignoredbytes:
-                print('ignoring source %s volumes %s (%d files in %s GB) not in target %s' % (source, ', '.join(ignoredvolumes), ignoredfiles, round_gb(ignoredbytes), target))
-            else:
-                print('target %s includes all volumes from source %s' % (target, source))
+            print(self.statusmap['ignored'])
 
         (nbytes, copies, pathprefix_counts) = (0, [], PathPrefixCounter())
         selector = CopySelector(src.items(), targ.items(), srcmatchprefixes.items())
@@ -547,34 +574,48 @@ class Ksync:
             if targ in targfiles:
                 replacefiles += 1
                 replacebytes += size
-        print('copying %d files in %s GB replacing %d files in %s GB [total %d files in %s GB on matching volumes]' % (len(copies), round_gb(nbytes), replacefiles, round_gb(replacebytes), matchfiles, round_gb(matchbytes)))
+        self.statusmap['beforecopy'] = 'copying %d files in %s GB replacing %d files in %s GB [total %d files in %s GB on matching volumes]' % (len(copies), round_gb(nbytes), replacefiles, round_gb(replacebytes), matchfiles, round_gb(matchbytes))
+        self._prometheus()
+        if not self.quietmode:
+            print(self.statusmap['beforecopy'])
+            (lastprefix, lastlst) = ('/', [0, 0])
+            for (prefix, lst) in pathprefix_counts.get_counts():
+                strprefix = str(prefix)
+                if strprefix.startswith(lastprefix) and lst == lastlst:
+                    continue
+                if lst[0] > 9 and nbytes < lst[1] * 100:
+                    assert lastprefix[0] == '/', lastprefix
+                    assert strprefix[0] == '/', strprefix
+                    slash = 0
+                    for n in range(1, min(len(lastprefix), len(strprefix))):
+                        if strprefix[n] == '/':
+                            slash = n
+                        if lastprefix[n] != strprefix[n]:
+                            break
+                    spaced = strprefix[slash:].rjust(len(strprefix), ' ')
+                    print('%s: %s GB in %d files' % (spaced, round_gb(lst[1]), lst[0]))
+                    (lastprefix, lastlst) = (strprefix, lst)
 
-        (lastprefix, lastlst) = ('/', [0, 0])
-        for (prefix, lst) in pathprefix_counts.get_counts():
-            strprefix = str(prefix)
-            if strprefix.startswith(lastprefix) and lst == lastlst:
-                continue
-            if lst[0] > 9 and nbytes < lst[1] * 100:
-                assert lastprefix[0] == '/', lastprefix
-                assert strprefix[0] == '/', strprefix
-                slash = 0
-                for n in range(1, min(len(lastprefix), len(strprefix))):
-                    if strprefix[n] == '/':
-                        slash = n
-                    if lastprefix[n] != strprefix[n]:
-                        break
-                spaced = strprefix[slash:].rjust(len(strprefix), ' ')
-                print('%s: %s GB in %d files' % (spaced, round_gb(lst[1]), lst[0]))
-                (lastprefix, lastlst) = (strprefix, lst)
+        def quantize(secs):
+            hour = 60*60
+            if secs < hour:
+                return ''
+            return ' for %d hr' % int(secs / hour)
 
         last = datetime.now()
         sorted_copies = sorted(copies)
         while sorted_copies or self.copy_processes:
             sorted_copies = self._schedule_copy(sorted_copies, srchost, targhost)
-            if (datetime.now() - last).seconds > 1*60:
+            now = datetime.now()
+            if (now - last).seconds > 1*60:
                 fails = (' (%d failed)' % self.process_failures) if self.process_failures else ''
                 zombies = (' (%d zombies)' % self.process_zombies) if self.process_zombies else ''
-                self._log('%d files not started; %d copies%s%s %s' % (len(sorted_copies), len(self.copy_processes), zombies, fails, self.bwm))
+                oldest = sorted([(started, bw) for (bw, p, size, started) in self.copy_processes])
+                running = ['%s=>%s %d Mb/s%s' % (bw[0], bw[1], bw[2], quantize((now-started).seconds)) for (started, bw) in oldest]
+                self.promoldest.set(oldest[0][0].timestamp() if oldest else 0)
+                self.statusmap['notstarted'] = len(sorted_copies)
+                self._prometheus()
+                self._log('%d files not yet started;%s%s %s' % (len(sorted_copies), fails, zombies, ', '.join(running)))
                 last = datetime.now()
 
         self._log('completed successfully')
@@ -590,7 +631,7 @@ class Ksync:
         """
         running_processes = []
         if self.copy_processes:
-            for (bw, p, size, started) in self.copy_processes:
+            for (bw, p, size, started, numfiles) in self.copy_processes:
                 retval = p.poll()
                 if retval is None:
                     elapsed = datetime.now() - started
@@ -598,18 +639,38 @@ class Ksync:
                     # ssh with ServerAliveInterval should prevent zombies, so we disable this for now
                     if False: # bw and elapsed > 120 + 4 * target:
                         self.process_zombies += 1
+                        self.promzombies.inc()
                         self.bwm.stop(bw)
                         self._log('zombie process copying %s GB at limit %s Mb/s reaped after %d sec' % (round_gb(size), bw, elapsed))
                         bw = None
-                    running_processes.append((bw, p, size, started)) # not terminated
+                    running_processes.append((bw, p, size, started, numfiles)) # not terminated
                 else:
-                    if retval:
-                        self._log('%s aborted with code %d' % (p.args, retval))
+                    if retval == 255:
+                        # often an I/O error
+                        args = ' '.join(p.args)
+                        self._log('%s...%s aborted with code 255; restarting' % (args[:35], args[-35:]))
                         self.process_failures += 1
-                        # TODO: restart this once?
-                    self.bwm.stop(bw)
+                        self.promrestarts.inc()
+                        p = subprocess.Popen(p.args)
+                        self.promlatency.observe((datetime.now() - started).seconds)
+                        running_processes.append((bw, p, size, datetime.now()))
+                    else:
+                        if retval:
+                            self._log('%s aborted with code %d' % (p.args, retval))
+                            self.process_failures += 1
+                            self.promfails.inc()
+                        else:
+                            self.promlatency.observe((datetime.now() - started).seconds)
+                            self.promfiles.inc(numfiles)
+                            self.prombytes.inc(size)
+                        self.bwm.stop(bw)
             if running_processes:
                 time.sleep(1)
+        for n in range(len(running_processes), len(self.copy_processes)):
+            try:
+                del self.statusmap['process_%d' % n]
+            except KeyError:
+                pass
         self.copy_processes = running_processes
         if not sorted_copies:
             return sorted_copies
@@ -669,6 +730,7 @@ class Ksync:
         CHUNKSIZE = 10 # FIXME, use file size
         prefix = sorted_copies[0][2]
         chunk = [f for f in sorted_copies[:CHUNKSIZE] if f[2] == prefix]
+        self.statusmap['current_prefix'] = prefix
 
         # chunk are the next CHUNKSIZE files with the same prefix (e.g. in the same volume).
         # we are local to either src or targ and need to adjust the relative path root accordingly
@@ -698,7 +760,8 @@ class Ksync:
                 sshwrap = []
             else:
                 sshwrap = ['ssh', '-nxAT', '-oServerAliveInterval=10', '%s@%s' % (self._getvar('ssh_user', srchost), srchost['dns'][0])]
-            earg = ['ssh -p%s' % targport] if targport else ['ssh']
+            eport = ' -p%s' % targport if targport else ''
+            earg = ['ssh%s -oServerAliveInterval=10' % eport]
             sources = [addrelative(f[0], f[1], f[2]) for f in chunk if includefile(f[0])]
             dest = ['%s%s' % (targuserhost, chunk[0][2])]
 
@@ -707,19 +770,22 @@ class Ksync:
         bwlimit = ['--bwlimit=%d' % (sel[2]*1000)] if (sel and sel[2]) else []
         p = subprocess.Popen(sshwrap + ['rsync'] + bwlimit + ['--protect-args', '--checksum', '--relative', '--partial-dir=.rsync-partial', '-e'] + ([shlex.quote(f) for f in earg + sources + dest] if sshwrap else (earg + sources + dest)))
         self.bwm.start(sel)
-        self.copy_processes.append((sel, p, sum([f[3] for f in chunk]), datetime.now()))
+        self.copy_processes.append((sel, p, sum([f[3] for f in chunk]), datetime.now(), len(chunk)))
         return sorted_copies[len(chunk):]
 
     
 def main(argv, quietmode=False, fullmode=False):
     if len(argv) < 3:
-        raise Exception('Usage: %s [--quiet] [--full] [install|fprint|pull|cp] configfile [host] ...' % argv[0])
+        raise Exception('Usage: %s [--port=<prometheus-client-port>] [--quiet] [--full] [install|fprint|pull|cp] configfile [host] ...' % argv[0])
     if argv[1] == '--quiet':
         del argv[1]
         return main(argv, quietmode=True, fullmode=fullmode)
     elif argv[1] == '--full':
         del argv[1]
         return main(argv, quietmode=quietmode, fullmode=True)
+    elif argv[1].startswith('--port='):
+        prometheus_client.start_http_server(int(argv[1][7:]))
+        del argv[1]
     cmd = argv[1]
     config = toml.load(argv[2])
     ksync = Ksync(config, quietmode, socket.gethostname())
