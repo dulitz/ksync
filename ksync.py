@@ -155,6 +155,9 @@ class Snapshot:
     def get_volumes(self):
         return self.stack[0]['volumes'] # most recent incremental
 
+    def get_started(self):
+        return self.stack[0]['started'] # most recent incremental
+
     def items(self):
         """returns an iterator over all the (fingerprint, filelist) items"""
         fprints = [x['fprints'].items() for x in self.stack]
@@ -221,6 +224,7 @@ class BandwidthManager:
     def __init__(self, config):
         self.bwlimits = config.get('bandwidth', {})
         self.inuse = {}
+        self.prom_inuse = prometheus_client.Gauge('ksync_bandwidth_mbps', 'bandwidth in use')
 
     def start(self, bw):
         if bw:
@@ -245,6 +249,7 @@ class BandwidthManager:
     def _modify_inuse(self, bw):
         """positive delta is Mbps of flow being started; negative is Mbps of flow being stopped"""
         (srchostname, targhostname, delta) = bw
+        self.prom_inuse.labels(source=srchostname, target=targhostname).inc(delta)
         srcdict = self.inuse.get(srchostname, {})
         if not srcdict:
             srcdict['egress'] = 0
@@ -304,15 +309,31 @@ class Ksync:
         (self.config, self.quietmode) = (config, quietmode)
         self.lastlogline = ''
         self.statusmap = {}
-        self.prominfo = prometheus_client.Info('ksync', 'Configuration settings for ksync')
-        self.promzombies = prometheus_client.Counter('process_zombies', 'zombie rsyncs killed')
-        self.promrestarts = prometheus_client.Counter('process_restarts', 'rsyncs restarted')
-        self.promfails = prometheus_client.Counter('process_failures', 'rsyncs failed and not restarted')
-        self.promfiles = prometheus_client.Counter('files_copied', 'files copied successfully')
-        self.prombytes = prometheus_client.Counter('bytes_copied', 'bytes copied successfully')
-        self.promrunning = prometheus_client.Gauge('processes_running', 'rsyncs running')
-        self.promlatency = prometheus_client.Summary('process_latency', 'rsync latency')
+        self.prominfo = prometheus_client.Info('ksync', 'Configuration of ksync')
+        self.promzombies = prometheus_client.Counter('ksync_zombies', 'zombie rsyncs killed')
+        self.promrestarts = prometheus_client.Counter('ksync_restarts', 'rsyncs restarted')
+        self.promfails = prometheus_client.Counter('ksync_failures', 'rsyncs failed and not restarted')
+        self.promfiles = prometheus_client.Counter('ksync_copied_files', 'files copied successfully')
+        self.prombytes = prometheus_client.Counter('ksync_copied_bytes', 'bytes copied successfully')
+        self.promrunning = prometheus_client.Gauge('ksync_processes_running', 'rsyncs running')
+        self.promoldest = prometheus_client.Gauge('ksync_oldest_process_time', 'timestamp when oldest running process was started')
+        self.promlatency = prometheus_client.Summary('ksync_latency', 'rsync latency')
+        self.promsourcets = prometheus_client.Gauge('ksync_source_snapshot_time', 'when the source snapshot was started')
+        self.promtargetts = prometheus_client.Gauge('ksync_target_snapshot_time', 'when the target snapshot was started')
+        self.promreplacebytes = prometheus_client.Gauge('ksync_replace_bytes', 'number of bytes that will be replaced after copy')
+        self.promreplacefiles = prometheus_client.Gauge('ksync_replace_files', 'number of files that will be replaced after copy')
+        self.promcopybytes = prometheus_client.Gauge('ksync_copy_bytes', 'number of bytes that will be replaced after copy')
+        self.promcopyfiles = prometheus_client.Gauge('ksync_copy_files', 'number of files that will be replaced after copy')
         self.hostname = config.get('hostmap', {}).get(hostname, hostname)
+        # DONE Gauges: total octets to replace, total files to replace
+        # DONE Gauges: total octets to copy, total files to copy
+        # DONE Counters: octets copied, files copied
+        # DONE Gauge: bandwidth_mbps{from="upwest" to="feast"}: 50
+        # DONE promsourcets, promtargetts
+        # DONE Gauge: copy processes running
+        # DONE Counter: restartable failures of copy processes
+        # DONE Counter: non-restartable failures of copy processes
+        # DONE Counter: zombie processes killed and restarted
 
         if 'hosts' not in config:
             raise Exception('config must have hosts section')
@@ -345,12 +366,6 @@ class Ksync:
             else:
                 self.lastlogline = line
                 print(line)
-    def _prometheus(self):
-        self.promrunning.set(len(self.copy_processes))
-        for n in range(0, len(self.copy_processes)):
-            self.statusmap['process_%d' % n] = ' '.join(self.copy_processes[n][1].args)
-        self.statusmap['bandwidthmanager'] = str(self.bwm)
-        self.prominfo.info(self.statusmap)
 
     def install(self, host, sources):
         """ssh to the host and create its working directory if it doesn't exist. copy the config, req.txt,
@@ -503,13 +518,9 @@ class Ksync:
         targhost = self._gethost(target)
         src = Snapshot(srchost, directory=workdir)
         targ = Snapshot(targhost, directory=workdir)
-        self.statusmap = {
-            'source': source,
-            'target': target,
-            'working_directory': workdir,
-            'source_snapshot': src.get_top_filename(),
-            'target_snapshot': targ.get_top_filename()
-            }
+        self.prominfo.info({ 'source': source, 'target': target })
+        self.promsourcets.set(datetime.isoformat(src.get_started()).timestamp())
+        self.promtargts.set(datetime.isoformat(targ.get_started()).timestamp())
         targvolumes = {}
         srcmatchprefixes = {}
         targmatchprefixes = {}
@@ -544,12 +555,11 @@ class Ksync:
                 ignoredfiles += 1
                 ignoredbytes += payloadlist[0][1]
         if ignoredfiles or ignoredvolumes or ignoredbytes:
-            self.statusmap['ignored'] = 'ignoring source %s volumes %s (%d files in %s GB) not in target %s' % (source, ', '.join(ignoredvolumes), ignoredfiles, round_gb(ignoredbytes), target)
+            ignored = 'ignoring source %s volumes %s (%d files in %s GB) not in target %s' % (source, ', '.join(ignoredvolumes), ignoredfiles, round_gb(ignoredbytes), target)
         else:
-            self.statusmap['ignored'] = 'target %s includes all volumes from source %s' % (target, source)
-        self._prometheus()
+            ignored = 'target %s includes all volumes from source %s' % (target, source)
         if not self.quietmode:
-            print(self.statusmap['ignored'])
+            print(ignored)
 
         (nbytes, copies, pathprefix_counts) = (0, [], PathPrefixCounter())
         selector = CopySelector(src.items(), targ.items(), srcmatchprefixes.items())
@@ -574,10 +584,13 @@ class Ksync:
             if targ in targfiles:
                 replacefiles += 1
                 replacebytes += size
-        self.statusmap['beforecopy'] = 'copying %d files in %s GB replacing %d files in %s GB [total %d files in %s GB on matching volumes]' % (len(copies), round_gb(nbytes), replacefiles, round_gb(replacebytes), matchfiles, round_gb(matchbytes))
-        self._prometheus()
+        beforecopy = 'copying %d files in %s GB replacing %d files in %s GB [total %d files in %s GB on matching volumes]' % (len(copies), round_gb(nbytes), replacefiles, round_gb(replacebytes), matchfiles, round_gb(matchbytes))
+        self.promreplacebytes.set(replacebytes)
+        self.promreplacefiles.set(replacefiles)
+        self.promcopybytes.set(nbytes)
+        self.promcopyfiles.set(len(copies))
         if not self.quietmode:
-            print(self.statusmap['beforecopy'])
+            print(beforecopy)
             (lastprefix, lastlst) = ('/', [0, 0])
             for (prefix, lst) in pathprefix_counts.get_counts():
                 strprefix = str(prefix)
@@ -605,16 +618,15 @@ class Ksync:
         last = datetime.now()
         sorted_copies = sorted(copies)
         while sorted_copies or self.copy_processes:
+            self.promrunning.set(len(self.copy_processes))
             sorted_copies = self._schedule_copy(sorted_copies, srchost, targhost)
             now = datetime.now()
             if (now - last).seconds > 1*60:
                 fails = (' (%d failed)' % self.process_failures) if self.process_failures else ''
                 zombies = (' (%d zombies)' % self.process_zombies) if self.process_zombies else ''
-                oldest = sorted([(started, bw) for (bw, p, size, started) in self.copy_processes])
+                oldest = sorted([(started, bw) for (bw, p, size, started, numfiles) in self.copy_processes])
                 running = ['%s=>%s %d Mb/s%s' % (bw[0], bw[1], bw[2], quantize((now-started).seconds)) for (started, bw) in oldest]
                 self.promoldest.set(oldest[0][0].timestamp() if oldest else 0)
-                self.statusmap['notstarted'] = len(sorted_copies)
-                self._prometheus()
                 self._log('%d files not yet started;%s%s %s' % (len(sorted_copies), fails, zombies, ', '.join(running)))
                 last = datetime.now()
 
@@ -666,11 +678,6 @@ class Ksync:
                         self.bwm.stop(bw)
             if running_processes:
                 time.sleep(1)
-        for n in range(len(running_processes), len(self.copy_processes)):
-            try:
-                del self.statusmap['process_%d' % n]
-            except KeyError:
-                pass
         self.copy_processes = running_processes
         if not sorted_copies:
             return sorted_copies
@@ -730,7 +737,6 @@ class Ksync:
         CHUNKSIZE = 10 # FIXME, use file size
         prefix = sorted_copies[0][2]
         chunk = [f for f in sorted_copies[:CHUNKSIZE] if f[2] == prefix]
-        self.statusmap['current_prefix'] = prefix
 
         # chunk are the next CHUNKSIZE files with the same prefix (e.g. in the same volume).
         # we are local to either src or targ and need to adjust the relative path root accordingly
