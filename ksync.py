@@ -224,7 +224,7 @@ class BandwidthManager:
     def __init__(self, config):
         self.bwlimits = config.get('bandwidth', {})
         self.inuse = {}
-        self.prom_inuse = prometheus_client.Gauge('ksync_bandwidth_mbps', 'bandwidth in use')
+        self.prom_inuse = prometheus_client.Gauge('ksync_bandwidth_mbps', 'bandwidth in use', labelnames=['source', 'target'])
 
     def start(self, bw):
         if bw:
@@ -519,8 +519,8 @@ class Ksync:
         src = Snapshot(srchost, directory=workdir)
         targ = Snapshot(targhost, directory=workdir)
         self.prominfo.info({ 'source': source, 'target': target })
-        self.promsourcets.set(datetime.isoformat(src.get_started()).timestamp())
-        self.promtargts.set(datetime.isoformat(targ.get_started()).timestamp())
+        self.promsourcets.set(datetime.fromisoformat(src.get_started()).timestamp())
+        self.promtargetts.set(datetime.fromisoformat(targ.get_started()).timestamp())
         targvolumes = {}
         srcmatchprefixes = {}
         targmatchprefixes = {}
@@ -559,7 +559,7 @@ class Ksync:
         else:
             ignored = 'target %s includes all volumes from source %s' % (target, source)
         if not self.quietmode:
-            print(ignored)
+            self._log(ignored)
 
         (nbytes, copies, pathprefix_counts) = (0, [], PathPrefixCounter())
         selector = CopySelector(src.items(), targ.items(), srcmatchprefixes.items())
@@ -567,7 +567,7 @@ class Ksync:
             srcprefix = targmatchprefixes[targprefix]
             for f in srcfilelist:
                 if f[0].startswith(srcprefix):
-                    copies.append((f[0], f[0].replace(srcprefix, targprefix, 1), targprefix, f[2]))
+                    copies.append((f[0], f[0].replace(srcprefix, targprefix, 1), targprefix, f[1]))
                     start = srcprefix.rfind('/')
                     pathprefix_counts.add_path(f[0].replace(srcprefix, srcprefix[start:], 1), f[1])
                     break
@@ -771,12 +771,15 @@ class Ksync:
             sources = [addrelative(f[0], f[1], f[2]) for f in chunk if includefile(f[0])]
             dest = ['%s%s' % (targuserhost, chunk[0][2])]
 
+        assert dest
         if printonly:
             sshwrap = ['echo'] + sshwrap
         bwlimit = ['--bwlimit=%d' % (sel[2]*1000)] if (sel and sel[2]) else []
-        p = subprocess.Popen(sshwrap + ['rsync'] + bwlimit + ['--protect-args', '--checksum', '--relative', '--partial-dir=.rsync-partial', '-e'] + ([shlex.quote(f) for f in earg + sources + dest] if sshwrap else (earg + sources + dest)))
-        self.bwm.start(sel)
-        self.copy_processes.append((sel, p, sum([f[3] for f in chunk]), datetime.now(), len(chunk)))
+        if sources:
+            # there might not be any if includefile returned false for every file in the chunk
+            p = subprocess.Popen(sshwrap + ['rsync'] + bwlimit + ['--protect-args', '--checksum', '--relative', '--partial-dir=.rsync-partial', '-e'] + ([shlex.quote(f) for f in earg + sources + dest] if sshwrap else (earg + sources + dest)))
+            self.bwm.start(sel)
+            self.copy_processes.append((sel, p, sum([f[3] for f in chunk]), datetime.now(), len(chunk)))
         return sorted_copies[len(chunk):]
 
     
